@@ -52,6 +52,7 @@
 #include "esp_attr.h"
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
+#include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -97,7 +98,11 @@ static const char *TAG = "muse_chat_session";
 #define IN_BYTES (MIC_RATE * 2 * 2)        /* 2 s of mic backlog while connecting */
 #define OUT_BYTES (MIC_RATE * 2 * 1)       /* 1 s of decoded reply */
 #else
+#if CONFIG_MUSE_TTS
+#define MP3_BUF (2 * 1024 * 1024)         /* 120 s of 128 kbps speech, before playback */
+#else
 #define MP3_BUF (512 * 1024)
+#endif
 #define IN_BYTES (MIC_RATE * 2 * 8)        /* 8 s of mic backlog while connecting */
 #define OUT_BYTES (MIC_RATE * 2 * 2)       /* 2 s of decoded reply */
 #endif
@@ -266,6 +271,7 @@ static char s_reply_shown[EV_TEXT];   /* the pre-speech caption last sent */
 static void mark(mark_t m);
 static bool open_note(void);
 static void log_marks(void);
+static void stop_tts(void);
 static int16_t *s_pcm;       /* MINIMP3_MAX_SAMPLES_PER_FRAME */
 static int16_t *s_pcm16;     /* resampled output */
 static int64_t s_last_seq;
@@ -960,6 +966,7 @@ static void turn_reset_streams(void)
 
 static void turn_finish(void)
 {
+    stop_tts();
     turn_reset_streams();
     s_turn.phase = P_IDLE;
     s_turn.dict_id = s_turn.chat_id = 0;
@@ -1508,6 +1515,129 @@ static void on_chat_ack(stream_t *s)
 
 /* ---- Turn: speech ---- */
 
+/* ---- Cloud speech (all state belongs to the session task) ---- */
+
+#if CONFIG_MUSE_TTS
+static esp_http_client_handle_t s_tts_http;
+static char *s_tts_body;
+static int s_tts_attempt;
+static int64_t s_tts_started;
+static bool s_tts_overflow;
+static bool s_tts_audio;
+
+static char *build_tts_body(const char *text)
+{
+    char clean[TEXT_MAX];
+    size_t n = 0;
+    while (*text && n < sizeof(clean) - 1) {
+        unsigned char c = *text;
+        size_t width = c < 0x80 ? 1 : (c & 0xe0) == 0xc0 ? 2 : (c & 0xf0) == 0xe0 ? 3 : 4;
+        size_t have = 1;
+        while (have < width && text[have] && ((unsigned char)text[have] & 0xc0) == 0x80) have++;
+        if (have != width || n + width >= sizeof(clean)) break;
+        if (width < 4 && (width > 1 || !strchr("*#`|", c))) {
+            memcpy(clean + n, text, width);
+            if (c == '_') clean[n] = ' ';
+            n += width;
+        }
+        text += width;
+    }
+    clean[n] = '\0';
+    cJSON *body = cJSON_CreateObject();
+    if (!body) return nullptr;
+    bool ok = cJSON_AddStringToObject(body, "model", CONFIG_MUSE_TTS_MODEL) &&
+              cJSON_AddStringToObject(body, "input", clean) &&
+              cJSON_AddStringToObject(body, "voice", CONFIG_MUSE_TTS_VOICE) &&
+              cJSON_AddStringToObject(body, "response_format", "mp3");
+    char *json = ok ? cJSON_PrintUnformatted(body) : nullptr;
+    cJSON_Delete(body);
+    return json;
+}
+
+static esp_err_t tts_http_event(esp_http_client_event_t *ev)
+{
+    if (ev->event_id == HTTP_EVENT_ON_HEADER && !strcasecmp(ev->header_key, "Content-Type")) {
+        s_tts_audio = !strncasecmp(ev->header_value, "audio/mpeg", 10);
+        /* IDF's async perform treats a quiet body socket as incomplete data,
+         * rather than EAGAIN. Allow pauses between generated speech segments. */
+        if (s_tts_audio) esp_http_client_set_timeout_ms(ev->client, 5000);
+    }
+    if (ev->event_id == HTTP_EVENT_ON_DATA && esp_http_client_get_status_code(ev->client) == 200) {
+        size_t n = ev->data_len;
+        if (n > MP3_BUF - s_turn.mp3_len) {
+            s_tts_overflow = true;
+        } else if (!s_tts_overflow) {
+            memcpy(s_turn.mp3 + s_turn.mp3_len, ev->data, n);
+            s_turn.mp3_len += n;
+        }
+    }
+    return ESP_OK;
+}
+
+static bool open_tts(void)
+{
+    esp_http_client_config_t cfg = {};
+    cfg.url = CONFIG_MUSE_TTS_URL;
+    cfg.method = HTTP_METHOD_POST;
+    cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    cfg.event_handler = tts_http_event;
+    cfg.is_async = true;
+    cfg.timeout_ms = 100;   /* poll for headers; allow longer reads once audio starts */
+    s_tts_http = esp_http_client_init(&cfg);
+    s_turn.mp3_len = 0;
+    s_tts_overflow = false;
+    s_tts_audio = false;
+    s_tts_started = now_us();
+    if (!s_tts_http) return false;
+    esp_http_client_set_header(s_tts_http, "Content-Type", "application/json");
+    esp_http_client_set_header(s_tts_http, "Authorization", "Bearer " CONFIG_MUSE_TTS_TOKEN);
+    esp_http_client_set_post_field(s_tts_http, s_tts_body, strlen(s_tts_body));
+    return true;
+}
+#endif
+
+static void stop_tts(void)
+{
+#if CONFIG_MUSE_TTS
+    if (s_tts_http) esp_http_client_cleanup(s_tts_http);
+    s_tts_http = nullptr;
+    free(s_tts_body);
+    s_tts_body = nullptr;
+#endif
+}
+
+static void poll_tts(void)
+{
+#if CONFIG_MUSE_TTS
+    if (!s_tts_http) return;
+    esp_err_t err = esp_http_client_perform(s_tts_http);
+    if (err == ESP_ERR_HTTP_EAGAIN && now_us() - s_tts_started < 45000000) return;
+    int status = esp_http_client_get_status_code(s_tts_http);
+    bool complete = esp_http_client_is_complete_data_received(s_tts_http);
+    bool ok = err == ESP_OK && status == 200 && s_tts_audio && !s_tts_overflow && s_turn.mp3_len &&
+              complete;
+    ESP_LOGI(TAG, "TTS fetch: err=%s status=%d mp3=%u bytes elapsed=%lld ms attempt=%d",
+             esp_err_to_name(err), status, (unsigned)s_turn.mp3_len,
+             (now_us() - s_tts_started) / 1000, s_tts_attempt);
+    esp_http_client_cleanup(s_tts_http);
+    s_tts_http = nullptr;
+    /* Nothing has played yet, so a transient failure can safely restart. */
+    bool retryable = err != ESP_OK || status <= 0 || status == 429 || status >= 500 || (status == 200 && !complete);
+    if (!ok && !s_tts_overflow && s_tts_attempt++ < 2 && retryable) {
+        if (open_tts()) return;
+    }
+    stop_tts();
+    if (!ok) {
+        turn_fail("SPEECH UNAVAILABLE");
+        return;
+    }
+    mark(M_MP3);
+    s_turn.mp3_ended = true;
+    msg_t &m = s_turn.msgs[s_turn.tts_msg];
+    ESP_LOGI(TAG, "speaking message %s via TTS (%u chars)", m.id, (unsigned)m.len);
+#endif
+}
+
 static void start_tts(void)
 {
     if (s_turn.tts_msg >= 0) {
@@ -1518,6 +1648,28 @@ static void start_tts(void)
         if (m.tts != TTS_QUEUED) {
             continue;
         }
+#if CONFIG_MUSE_TTS
+        if (muse_settings_speaker_on()) {
+            if (!s_turn.texts || !CONFIG_MUSE_TTS_TOKEN[0]) {
+                turn_fail("SPEECH NOT CONFIGURED");
+                return;
+            }
+            s_tts_body = build_tts_body(s_turn.texts + i * TEXT_MAX);
+            m.tts = TTS_ACTIVE;
+            m.pcm_start = s_turn.pcm_out;
+            m.pcm_frames = 0;
+            s_turn.tts_msg = i;
+            s_turn.silent = false;
+            s_turn.mp3_ended = false;
+            s_turn.kbps = s_turn.down_rate = 0;
+            mp3dec_init(&s_turn.dec);
+            s_tts_attempt = 1;
+            mark(M_TTS);
+            show_reply_start(m);
+            if (!s_tts_body || !open_tts()) turn_fail("CAN'T START SPEECH");
+            return;
+        }
+#endif
         /*
          * Replies are text, shown at reading pace: silence in place of speech
          * paces the captions and ends the turn. To speak them instead, send
@@ -1591,6 +1743,9 @@ static void pace_silently(void)
 /* Decodes buffered MP3 while the reply buffer has room. */
 static void decode(void)
 {
+#if CONFIG_MUSE_TTS
+    if (s_tts_http) return;   /* validate the complete response before playing/retrying */
+#endif
     if (s_turn.tts_msg < 0) {
         return;
     }
@@ -1997,6 +2152,7 @@ static void hatch_task(void *arg)
         }
         if (s_turn.phase == P_WAIT_REPLY) {
             start_tts();
+            poll_tts();
             decode();
         }
         if (!s_connected) {
